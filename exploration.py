@@ -114,4 +114,39 @@ class ExplorationSystem:
         """Обработчик боевого события"""
         enemy = details["enemy"]
         combat_result = self.combat_system.fight(player, enemy)
-        details.update(comb
+        details.update(combat_result)
+    
+    def _handle_treasure(self, player: Player, details: Dict):
+        """Обработчик находки сокровища"""
+        player.gold += details["gold"]
+        for item in details.get("items", []):
+            player.add_to_inventory(item)
+    
+    def _handle_nothing(self, player: Player, details: Dict):
+        """Обработчик отсутствия событий"""
+        pass
+    
+    def _handle_npc(self, player: Player, details: Dict):
+        """Обработчик встречи с NPC"""
+        pass
+
+    def move_player(self, player: Player, direction: str) -> Dict:
+        """Перемещает игрока в указанном направлении"""
+        directions = {
+            'north': (0, 1),
+            'south': (0, -1),
+            'east': (1, 0),
+            'west': (-1, 0)
+        }
+        
+        if direction not in directions:
+            return {"success": False, "message": "Неверное направление"}
+        
+        dx, dy = directions[direction]
+        new_x, new_y = player.x + dx, player.y + dy
+        
+        if not self.world.is_valid_coordinates((new_x, new_y)):
+            return {"success": False, "message": "Нельзя идти в этом направлении"}
+        
+        player.x, player.y = new_x, new_y
+        return {"success": True, "message": "Вы переместились", "coordinates": (new_x, new_y)}
