@@ -1,106 +1,117 @@
-############################
-### exploration.py - Исследование мира ###
-############################
-"""
-Модуль исследования мира:
-- Исследование локаций
-- Случайные события
-- Нахождение предметов
-- Секретные локации
-- Встречи с другими игроками
-"""
 import random
-import database as db
-import world
+import logging
+from typing import Dict, Tuple, Optional
+from player import Player
+from world import World
+from combat import CombatSystem
 
-def explore(bot, message):
-    player_id = message.from_user.id
-    player_data = db.load_player(player_id)
+logger = logging.getLogger(__name__)
+
+class ExplorationSystem:
+    def __init__(self, world: World, combat_system: CombatSystem):
+        self.world = world
+        self.combat_system = combat_system
+        self.event_handlers = {
+            'combat': self._handle_combat,
+            'treasure': self._handle_treasure,
+            'nothing': self._handle_nothing,
+            'npc': self._handle_npc
+        }
     
-    if player_data is None:
-        bot.send_message(message.chat.id, "❌ Ошибка загрузки данных! Попробуй перезапустить бота командой /start")
-        return
-    
-    if player_data["state"] != "idle":
-        bot.send_message(message.chat.id, "❌ Ты уже чем-то занят!")
-        return
-    
-    # Проверяем, есть ли локации для исследования на этом этаже
-    floor = player_data["floor"]
-    if floor not in world.exploration_locations or floor > 5:
-        # Для этажей выше 5 используем локации 5 этажа
-        floor = min(floor, 5)
-    
-    # Выбираем случайную локацию
-    location = random.choice(world.exploration_locations[floor])
-    
-    # Шанс найти что-то особенное зависит от удачи
-    special_chance = player_data["stats"]["luck"] / 200
-    
-    # Награда за исследование
-    gold_gain = random.randint(*location["gold"])
-    exp_gain = location["exp"]
-    
-    player_data["gold"] += gold_gain
-    player_data["exp"] += exp_gain
-    player_data["explored"] = min(100, player_data["explored"] + random.randint(1, 5))
-    
-    floor_desc = world.FLOOR_DESCRIPTIONS.get(player_data["floor"], f"Этаж {player_data['floor']}")
-    result_text = (
-        f"🌍 На {floor_desc} ты исследуешь *{location['name']}*\n"
-        f"{location['description']}\n\n"
-        f"🪙 Нашел {gold_gain} золота | 🎲 Получил {exp_gain} опыта\n"
-        f"🔍 Прогресс исследования: {player_data['explored']}%"
-    )
-    
-    # Проверяем, нашли ли что-то особенное
-    if "special" in location and random.random() < special_chance:
-        special_item = location["special"]
-        player_data["inventory"].append(special_item)
+    def explore(self, player: Player, coordinates: Tuple[int, int]) -> Dict:
+        """Основной метод исследования локации"""
+        if not self.world.is_valid_coordinates(coordinates):
+            return {"success": False, "message": "Нельзя исследовать за пределами карты"}
         
-        if special_item == "skill_scroll":
-            result_text += "\n\n📜 Ты нашел древний свиток с новым навыком!"
-            # Даем случайный навык для текущего оружия
-            weapon = player_data["current_weapon"]
-            new_skill = get_appropriate_skill(player_data, weapon)
-            if new_skill:
-                player_data["weapons"][weapon]["skills"].append(new_skill)
-                result_text += f"\n✨ Ты изучил *{new_skill}*!"
-        # ... другие специальные предметы
+        location = self.world.get_location(coordinates)
+        event = self._determine_event(player, location)
+        
+        result = {
+            "location": location,
+            "event_type": event["type"],
+            "details": event["details"],
+            "success": True
+        }
+        
+        self.event_handlers[event["type"]](player, event["details"])
+        
+        return result
     
-    # Шанс встретить другого игрока (15%)
-    if random.random() < 0.15:
-        online_players = db.get_online_players(player_data["floor"], exclude_id=player_id)
-        if online_players:
-            other_player = random.choice(online_players)
-            result_text += f"\n\n👥 Ты встретил игрока *{other_player['nickname']}* во время исследования!"
+    def _determine_event(self, player: Player, location: Dict) -> Dict:
+        """Определяет случайное событие в локации"""
+        event_weights = {
+            'combat': 0.4,
+            'treasure': 0.2,
+            'nothing': 0.3,
+            'npc': 0.1
+        }
+        
+        # Модификаторы в зависимости от типа локации
+        if location.get('danger_level', 0) > 5:
+            event_weights['combat'] += 0.2
+            event_weights['nothing'] -= 0.1
+            
+        event_type = random.choices(
+            list(event_weights.keys()),
+            weights=list(event_weights.values()),
+            k=1
+        )[0]
+        
+        return {
+            "type": event_type,
+            "details": self._generate_event_details(event_type, location)
+        }
     
-    # Шанс найти секретную локацию (5%)
-    if random.random() < 0.05:
-        secret_location = find_secret_location(player_data["floor"])
-        result_text += f"\n\n🔍 Ты обнаружил секретную локацию: *{secret_location['name']}*!"
-        # Добавляем в инвентарь ключ от локации
-        player_data["inventory"].append(f"key_{secret_location['id']}")
+    def _generate_event_details(self, event_type: str, location: Dict) -> Dict:
+        """Генерирует детали события"""
+        if event_type == 'combat':
+            return {
+                "enemy": self._generate_enemy(location),
+                "escape_chance": 0.7
+            }
+        elif event_type == 'treasure':
+            return {
+                "gold": random.randint(5, 50),
+                "items": self._generate_loot(location)
+            }
+        elif event_type == 'npc':
+            return {
+                "npc_type": random.choice(['trader', 'quest_giver', 'healer']),
+                "dialogue": "Приветствую, путник!"
+            }
+        else:
+            return {"description": "Вы ничего не нашли"}
     
-    # Шанс встретить монстра (30%)
-    if random.random() < 0.3:
-        result_text += "\n\n⚠️ Среди руин тебя атакует монстр!"
-        db.save_player(player_id, player_data)
-        bot.send_message(message.chat.id, result_text, parse_mode="Markdown")
-        # Инициируем бой
-        # ... (код для инициации боя)
-    else:
-        db.save_player(player_id, player_data)
-        bot.send_message(message.chat.id, result_text, parse_mode="Markdown")
-
-def get_appropriate_skill(player_data, weapon_type):
-    # ... (логика выбора навыка как в исходном коде)
-    return new_skill
-
-def find_secret_location(floor):
-    secret_locations = {
-        1: {"id": 101, "name": "Пещера Сокровищ", "min_level": 5},
-        2: {"id": 102, "name": "Заброшенный Храм", "min_level": 10},
-        # ... другие секретные локации
-    }
-    return random.choice(list(secret_locations.values()))
+    def _generate_enemy(self, location: Dict) -> Dict:
+        """Создает противника на основе локации"""
+        base_level = location.get('danger_level', 1)
+        enemy_types = ['goblin', 'skeleton', 'bandit', 'wolf']
+        
+        return {
+            "type": random.choice(enemy_types),
+            "level": max(1, base_level + random.randint(-1, 2)),
+            "health": 20 + base_level * 5,
+            "attack": 5 + base_level,
+            "defense": 3 + base_level,
+            "reward": {
+                "exp": 10 * base_level,
+                "gold": random.randint(3, 15) * base_level
+            }
+        }
+    
+    def _generate_loot(self, location: Dict) -> List[Dict]:
+        """Генерирует добычу"""
+        loot = []
+        if random.random() < 0.3:
+            loot.append({
+                "type": "consumable",
+                "name": random.choice(["Health Potion", "Mana Potion"]),
+                "effect": 20
+            })
+        return loot
+    
+    def _handle_combat(self, player: Player, details: Dict):
+        """Обработчик боевого события"""
+        enemy = details["enemy"]
+        combat_result = self.combat_system.fight(player, enemy)
+        details.update(comb
