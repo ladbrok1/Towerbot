@@ -22,7 +22,7 @@ import economy
 import guild
 
 # Инициализация бота
-TOKEN = "7698580548:AAGxtJRhkJBDhffYqUhJ_FtHpyMqlHEt1AA"
+TOKEN = ""
 bot = telebot.TeleBot(TOKEN)
 
 # Инициализация базы данных
