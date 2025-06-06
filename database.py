@@ -1,322 +1,465 @@
-############################
-### database.py - Работа с базой данных ###
-############################
-"""
-Модуль работы с базой данных:
-- Инициализация БД
-- Управление игроками
-- Серверный прогресс
-- Онлайн-статус
-- Глобальные события
-"""
 import sqlite3
-import json
-import time
 import logging
-from typing import Optional, Dict, List, Union, Tuple
+from typing import Optional, Dict, List
 
-# Настройка логирования
 logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, db_name: str = 'mmorpg.db'):
-        self.db_name = db_name
-        self.conn = None
+    def __init__(self, db_path: str = "game.db"):
+        self.db_path = db_path
+        self.connection = None
         self._initialize_db()
 
-    def _initialize_db(self) -> None:
-        """Инициализация базы данных и таблиц"""
+    def _initialize_db(self):
+        """Инициализировать базу данных и создать таблицы"""
         try:
-            self.conn = sqlite3.connect(self.db_name)
-            cursor = self.conn.cursor()
-            
-            # Таблица игроков
-            cursor.execute('''CREATE TABLE IF NOT EXISTS players (
-                player_id INTEGER PRIMARY KEY,
-                player_data TEXT NOT NULL,
-                last_active REAL DEFAULT 0,
-                guild_id INTEGER DEFAULT 0,
-                FOREIGN KEY (guild_id) REFERENCES guilds(guild_id)
-            ''')
-            
-            # Таблица серверного прогресса
-            cursor.execute('''CREATE TABLE IF NOT EXISTS server_progress (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                current_floor INTEGER DEFAULT 1,
-                boss_hp INTEGER DEFAULT 1000,
-                last_boss_kill REAL DEFAULT 0,
-                check (id = 1)
-            ''')
-            
-            # Таблица гильдий
-            cursor.execute('''CREATE TABLE IF NOT EXISTS guilds (
-                guild_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                leader_id INTEGER NOT NULL,
-                level INTEGER DEFAULT 1,
-                reputation INTEGER DEFAULT 0,
-                members TEXT DEFAULT '[]',
-                FOREIGN KEY (leader_id) REFERENCES players(player_id))
-            ''')
-            
-            # Таблица PvP рейтингов
-            cursor.execute('''CREATE TABLE IF NOT EXISTS pvp_ratings (
-                player_id INTEGER PRIMARY KEY,
-                rating INTEGER DEFAULT 1000,
-                wins INTEGER DEFAULT 0,
-                losses INTEGER DEFAULT 0,
-                FOREIGN KEY (player_id) REFERENCES players(player_id))
-            ''')
-            
-            # Таблица глобальных событий (новая)
-            cursor.execute('''CREATE TABLE IF NOT EXISTS global_events (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                start_time REAL NOT NULL,
-                end_time REAL NOT NULL,
-                event_data TEXT DEFAULT '{}')
-            ''')
-            
-            # Инициализация серверного прогресса
-            cursor.execute('SELECT 1 FROM server_progress WHERE id = 1')
-            if not cursor.fetchone():
-                cursor.execute('INSERT INTO server_progress (current_floor, boss_hp) VALUES (1, 1000)')
-            
-            self.conn.commit()
-            logger.info("База данных успешно инициализирована")
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Таблица игроков
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS players (
+                        player_id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        level INTEGER DEFAULT 1,
+                        exp INTEGER DEFAULT 0,
+                        gold INTEGER DEFAULT 0,
+                        health INTEGER DEFAULT 100,
+                        max_health INTEGER DEFAULT 100,
+                        attack INTEGER DEFAULT 10,
+                        defense INTEGER DEFAULT 5,
+                        inventory TEXT DEFAULT '{}',
+                        skills TEXT DEFAULT '{}',
+                        guild_id INTEGER,
+                        last_seen TEXT,
+                        FOREIGN KEY (guild_id) REFERENCES guilds(guild_id)
+                    )
+                ''')
+                
+                # Таблица гильдий
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS guilds (
+                        guild_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        tag TEXT NOT NULL,
+                        level INTEGER DEFAULT 1,
+                        created_at TEXT NOT NULL
+                    )
+                ''')
+                
+                # Таблица гильдейских участников
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS guild_members (
+                        guild_id INTEGER NOT NULL,
+                        player_id INTEGER NOT NULL,
+                        rank TEXT NOT NULL,
+                        joined_at TEXT NOT NULL,
+                        PRIMARY KEY (guild_id, player_id),
+                        FOREIGN KEY (guild_id) REFERENCES guilds(guild_id),
+                        FOREIGN KEY (player_id) REFERENCES players(player_id)
+                    )
+                ''')
+                
+                # Таблица предметов
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS items (
+                        item_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        stats TEXT DEFAULT '{}',
+                        price INTEGER DEFAULT 0
+                    )
+                ''')
+                
+                conn.commit()
+                logger.info("Database initialized successfully")
+                
         except sqlite3.Error as e:
-            logger.error(f"Ошибка инициализации БД: {e}")
+            logger.error(f"Database initialization error: {e}")
             raise
-        finally:
-            if self.conn:
-                self.conn.close()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        """Получение соединения с БД"""
-        if not self.conn:
-            self.conn = sqlite3.connect(self.db_name)
-        return self.conn
+    def get_connection(self):
+        """Получить соединение с базой данных"""
+        if self.connection is None:
+            self.connection = sqlite3.connect(self.db_path)
+            self.connection.row_factory = sqlite3.Row
+        return self.connection
 
-    def save_player(self, player_id: int, player_data: Dict) -> bool:
-        """Сохранение данных игрока"""
+    def close_connection(self):
+        """Закрыть соединение с базой данных"""
+        if self.connection:
+            self.connection.close()
+            self.connection = None
+
+    def execute_query(self, query: str, params: tuple = (), commit: bool = False):
+        """Выполнить SQL-запрос"""
         try:
-            conn = self._get_connection()
+            conn = self.get_connection()
             cursor = conn.cursor()
-            cursor.execute('''INSERT OR REPLACE INTO players 
-                            (player_id, player_data, last_active) 
-                            VALUES (?, ?, ?)''', 
-                         (player_id, json.dumps(player_data), time.time()))
-            conn.commit()
-            return True
+            cursor.execute(query, params)
+            if commit:
+                conn.commit()
+            return cursor
         except sqlite3.Error as e:
-            logger.error(f"Ошибка сохранения игрока {player_id}: {e}")
-            return False
+            logger.error(f"Query execution error: {e}")
+            raise
 
-    def load_player(self, player_id: int) -> Optional[Dict]:
-        """Загрузка данных игрока"""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT player_data FROM players WHERE player_id = ?', (player_id,))
-            result = cursor.fetchone()
-            return json.loads(result[0]) if result else None
-        except (sqlite3.Error, json.JSONDecodeError) as e:
-            logger.error(f"Ошибка загрузки игрока {player_id}: {e}")
-            return None
+    # Примеры методов для работы с игроками
+    def create_player(self, player_id: int, name: str):
+        """Создать нового игрока"""
+        self.execute_query(
+            '''
+            INSERT INTO players (player_id, name, last_seen)
+            VALUES (?, ?, datetime('now'))
+            ''',
+            (player_id, name),
+            commit=True
+        )
 
-    def get_online_players(self, floor: int, exclude_id: Optional[int] = None) -> List[Dict]:
-        """Получение списка онлайн игроков на указанном этаже"""
+    def get_player(self, player_id: int) -> Optional[Dict]:
+        """Получить данные игрока"""
+        cursor = self.execute_query(
+            'SELECT * FROM players WHERE player_id = ?',
+            (player_id,)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def update_player(self, player_id: int, updates: Dict):
+        """Обновить данные игрока"""
+        set_clause = ', '.join(f"{key} = ?" for key in updates.keys())
+        values = list(updates.values())
+        values.append(player_id)
+        
+        self.execute_query(
+            f'''
+            UPDATE players 
+            SET {set_clause}, last_seen = datetime('now')
+            WHERE player_id = ?
+            ''',
+            tuple(values),
+            commit=True
+        )
+
+       # Методы для работы с гильдиями
+    def create_guild(self, name: str, tag: str, leader_id: int) -> int:
+        """Создать новую гильдию"""
         try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            five_min_ago = time.time() - 300  # 5 минут
-            cursor.execute('SELECT player_id FROM players WHERE last_active > ?', (five_min_ago,))
-            online_ids = [row[0] for row in cursor.fetchall()]
-            
-            online_players = []
-            for player_id in online_ids:
-                if exclude_id is not None and player_id == exclude_id:
-                    continue
-                player_data = self.load_player(player_id)
-                if player_data and player_data.get("floor") == floor and player_data.get("state") == "idle":
-                    online_players.append(player_data)
-            
-            return online_players
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO guilds (name, tag, created_at)
+                    VALUES (?, ?, datetime('now'))
+                    ''',
+                    (name, tag)
+                guild_id = cursor.lastrowid
+                
+                # Добавить лидера в гильдию
+                cursor.execute(
+                    '''
+                    INSERT INTO guild_members (guild_id, player_id, rank, joined_at)
+                    VALUES (?, ?, 'leader', datetime('now'))
+                    ''',
+                    (guild_id, leader_id))
+                
+                # Обновить гильдию игрока
+                cursor.execute(
+                    '''
+                    UPDATE players 
+                    SET guild_id = ? 
+                    WHERE player_id = ?
+                    ''',
+                    (guild_id, leader_id))
+                
+                conn.commit()
+                return guild_id
         except sqlite3.Error as e:
-            logger.error(f"Ошибка получения онлайн игроков: {e}")
-            return []
-
-    def get_server_progress(self) -> Dict[str, Union[int, float]]:
-        """Получение серверного прогресса"""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT current_floor, boss_hp, last_boss_kill FROM server_progress WHERE id = 1')
-            result = cursor.fetchone()
-            
-            if result:
-                return {
-                    "current_floor": result[0],
-                    "boss_hp": result[1],
-                    "last_boss_kill": result[2] or 0
-                }
-            return {"current_floor": 1, "boss_hp": 1000, "last_boss_kill": 0}
-        except sqlite3.Error as e:
-            logger.error(f"Ошибка получения серверного прогресса: {e}")
-            return {"current_floor": 1, "boss_hp": 1000, "last_boss_kill": 0}
-
-    def update_server_progress(self, progress: Dict) -> bool:
-        """Обновление серверного прогресса"""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('''UPDATE server_progress 
-                            SET current_floor = ?, boss_hp = ?, last_boss_kill = ?
-                            WHERE id = 1''', 
-                         (progress.get("current_floor", 1),
-                          progress.get("boss_hp", 1000),
-                          progress.get("last_boss_kill", 0)))
-            conn.commit()
-            return True
-        except sqlite3.Error as e:
-            logger.error(f"Ошибка обновления серверного прогресса: {e}")
-            return False
-
-    # Далее идут методы для работы с гильдиями, PvP и глобальными событиями
-    # (приведены основные изменения, полный код будет в следующем сообщении)
+            logger.error(f"Error creating guild: {e}")
+            raise
 
     def get_guild(self, guild_id: int) -> Optional[Dict]:
-        """Получение данных гильдии"""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM guilds WHERE guild_id = ?', (guild_id,))
-            result = cursor.fetchone()
-            
-            if result:
-                return {
-                    'guild_id': result[0],
-                    'name': result[1],
-                    'leader_id': result[2],
-                    'level': result[3],
-                    'reputation': result[4],
-                    'members': json.loads(result[5])
-                }
-            return None
-        except (sqlite3.Error, json.JSONDecodeError) as e:
-            logger.error(f"Ошибка получения гильдии {guild_id}: {e}")
-            return None
+        """Получить информацию о гильдии"""
+        cursor = self.execute_query(
+            '''
+            SELECT g.*, 
+                   COUNT(gm.player_id) as member_count
+            FROM guilds g
+            LEFT JOIN guild_members gm ON g.guild_id = gm.guild_id
+            WHERE g.guild_id = ?
+            GROUP BY g.guild_id
+            ''',
+            (guild_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
-    def save_guild(self, guild_data: Dict) -> bool:
-        """Сохранение данных гильдии"""
-        try:
-            conn = self._get_connection()
+    def get_guild_members(self, guild_id: int) -> List[Dict]:
+        """Получить список участников гильдии"""
+        cursor = self.execute_query(
+            '''
+            SELECT p.player_id, p.name, p.level, gm.rank, gm.joined_at
+            FROM guild_members gm
+            JOIN players p ON gm.player_id = p.player_id
+            WHERE gm.guild_id = ?
+            ORDER BY 
+                CASE gm.rank
+                    WHEN 'leader' THEN 1
+                    WHEN 'officer' THEN 2
+                    WHEN 'member' THEN 3
+                    ELSE 4
+                END,
+                gm.joined_at
+            ''',
+            (guild_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    # Методы для работы с инвентарем
+    def get_player_inventory(self, player_id: int) -> Dict[str, int]:
+        """Получить инвентарь игрока"""
+        player = self.get_player(player_id)
+        if player and 'inventory' in player:
+            return json.loads(player['inventory'])
+        return {}
+
+    def update_player_inventory(self, player_id: int, inventory: Dict[str, int]):
+        """Обновить инвентарь игрока"""
+        self.execute_query(
+            '''
+            UPDATE players 
+            SET inventory = ?
+            WHERE player_id = ?
+            ''',
+            (json.dumps(inventory), player_id),
+            commit=True)
+
+    def add_item_to_inventory(self, player_id: int, item_id: str, quantity: int = 1):
+        """Добавить предмет в инвентарь"""
+        inventory = self.get_player_inventory(player_id)
+        inventory[item_id] = inventory.get(item_id, 0) + quantity
+        self.update_player_inventory(player_id, inventory)
+
+    # Методы для работы с предметами
+    def get_item_info(self, item_id: str) -> Optional[Dict]:
+        """Получить информацию о предмете"""
+        cursor = self.execute_query(
+            'SELECT * FROM items WHERE item_id = ?',
+            (item_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def create_item(self, item_data: Dict):
+        """Создать новый предмет в базе"""
+        self.execute_query(
+            '''
+            INSERT INTO items (item_id, name, type, stats, price)
+            VALUES (?, ?, ?, ?, ?)
+            ''',
+            (
+                item_data['id'],
+                item_data['name'],
+                item_data['type'],
+                json.dumps(item_data.get('stats', {})),
+                item_data.get('price', 0)
+            ),
+            commit=True)
+
+    # Методы для работы с квестами
+    def init_quests_table(self):
+        """Инициализировать таблицу квестов"""
+        self.execute_query('''
+            CREATE TABLE IF NOT EXISTS player_quests (
+                player_id INTEGER NOT NULL,
+                quest_id TEXT NOT NULL,
+                status TEXT NOT NULL,  -- 'not_started', 'in_progress', 'completed'
+                progress TEXT DEFAULT '{}',
+                started_at TEXT,
+                completed_at TEXT,
+                PRIMARY KEY (player_id, quest_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        ''', commit=True)
+
+    def get_player_quests(self, player_id: int) -> List[Dict]:
+        """Получить квесты игрока"""
+        cursor = self.execute_query(
+            '''
+            SELECT quest_id, status, progress, started_at, completed_at
+            FROM player_quests
+            WHERE player_id = ?
+            ''',
+            (player_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def update_quest_progress(self, player_id: int, quest_id: str, progress: Dict):
+        """Обновить прогресс квеста"""
+        self.execute_query(
+            '''
+            INSERT OR REPLACE INTO player_quests 
+            (player_id, quest_id, status, progress, started_at)
+            VALUES (?, ?, 'in_progress', ?, COALESCE(
+                (SELECT started_at FROM player_quests WHERE player_id = ? AND quest_id = ?),
+                datetime('now')
+            ))
+            ''',
+            (player_id, quest_id, json.dumps(progress), player_id, quest_id),
+            commit=True)
+
+    # Методы для работы с PvP
+    def init_pvp_tables(self):
+        """Инициализировать таблицы PvP статистики"""
+        self.execute_query('''
+            CREATE TABLE IF NOT EXISTS pvp_stats (
+                player_id INTEGER PRIMARY KEY,
+                kills INTEGER DEFAULT 0,
+                deaths INTEGER DEFAULT 0,
+                honor INTEGER DEFAULT 0,
+                last_pvp_time TEXT,
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        ''', commit=True)
+
+    def update_pvp_stats(self, player_id: int, kills: int = 0, deaths: int = 0, honor: int = 0):
+        """Обновить PvP статистику игрока"""
+        self.execute_query(
+            '''
+            INSERT OR REPLACE INTO pvp_stats 
+            (player_id, kills, deaths, honor, last_pvp_time)
+            VALUES (?, 
+                COALESCE((SELECT kills FROM pvp_stats WHERE player_id = ?), 0) + ?,
+                COALESCE((SELECT deaths FROM pvp_stats WHERE player_id = ?), 0) + ?,
+                COALESCE((SELECT honor FROM pvp_stats WHERE player_id = ?), 0) + ?,
+                datetime('now'))
+            ''',
+            (player_id, player_id, kills, player_id, deaths, player_id, honor),
+            commit=True)
+
+    # Методы для работы с рейдами
+    def init_raid_tables(self):
+        """Инициализировать таблицы рейдов"""
+        self.execute_query('''
+            CREATE TABLE IF NOT EXISTS raid_history (
+                raid_id TEXT PRIMARY KEY,
+                boss_id TEXT NOT NULL,
+                difficulty TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                status TEXT NOT NULL  -- 'completed', 'failed'
+            )
+        ''', commit=True)
+
+        self.execute_query('''
+            CREATE TABLE IF NOT EXISTS raid_participants (
+                raid_id TEXT NOT NULL,
+                player_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                damage_done INTEGER DEFAULT 0,
+                healing_done INTEGER DEFAULT 0,
+                loot_received TEXT DEFAULT '[]',
+                PRIMARY KEY (raid_id, player_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        ''', commit=True)
+
+    def save_raid_result(self, raid_data: Dict):
+        """Сохранить результаты рейда"""
+        with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''INSERT OR REPLACE INTO guilds 
-                            (guild_id, name, leader_id, level, reputation, members) 
-                            VALUES (?, ?, ?, ?, ?, ?)''',
-                          (guild_data.get('guild_id'),
-                           guild_data.get('name'),
-                           guild_data.get('leader_id'),
-                           guild_data.get('level', 1),
-                           guild_data.get('reputation', 0),
-                           json.dumps(guild_data.get('members', []))))
+            
+            # Сохранить основную информацию о рейде
+            cursor.execute(
+                '''
+                INSERT INTO raid_history 
+                (raid_id, boss_id, difficulty, start_time, end_time, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    raid_data['raid_id'],
+                    raid_data['boss_id'],
+                    raid_data['difficulty'],
+                    raid_data['start_time'],
+                    raid_data['end_time'],
+                    raid_data['status']
+                ))
+            
+            # Сохранить данные участников
+            for participant in raid_data['participants']:
+                cursor.execute(
+                    '''
+                    INSERT INTO raid_participants 
+                    (raid_id, player_id, role, damage_done, healing_done, loot_received)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        raid_data['raid_id'],
+                        participant['player_id'],
+                        participant['role'],
+                        participant.get('damage_done', 0),
+                        participant.get('healing_done', 0),
+                        json.dumps(participant.get('loot_received', []))
+                    ))
+            
             conn.commit()
-            return True
-        except (sqlite3.Error, json.JSONDecodeError) as e:
-            logger.error(f"Ошибка сохранения гильдии: {e}")
-            return False
 
-    def get_pvp_rating(self, player_id: int) -> Optional[Dict]:
-        """Получение PvP рейтинга игрока"""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT rating, wins, losses FROM pvp_ratings WHERE player_id = ?', (player_id,))
-            result = cursor.fetchone()
-            
-            if result:
-                return {
-                    "rating": result[0],
-                    "wins": result[1],
-                    "losses": result[2]
-                }
-            return None
-        except sqlite3.Error as e:
-            logger.error(f"Ошибка получения PvP рейтинга для {player_id}: {e}")
-            return None
+    # Методы для работы с экономикой
+    def init_economy_tables(self):
+        """Инициализировать таблицы экономики"""
+        self.execute_query('''
+            CREATE TABLE IF NOT EXISTS market_listings (
+                listing_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (seller_id) REFERENCES players(player_id)
+            )
+        ''', commit=True)
 
-    def update_pvp_rating(self, player_id: int, rating: int, wins: int, losses: int) -> bool:
-        """Обновление PvP рейтинга игрока"""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute('''INSERT OR REPLACE INTO pvp_ratings 
-                            (player_id, rating, wins, losses) 
-                            VALUES (?, ?, ?, ?)''',
-                          (player_id, rating, wins, losses))
-            conn.commit()
-            return True
-        except sqlite3.Error as e:
-            logger.error(f"Ошибка обновления PvP рейтинга для {player_id}: {e}")
-            return False
+    def create_market_listing(self, seller_id: int, item_id: str, quantity: int, 
+                            price: int, currency: str, duration_hours: int = 24):
+        """Создать новое предложение на рынке"""
+        self.execute_query(
+            '''
+            INSERT INTO market_listings 
+            (seller_id, item_id, quantity, price, currency, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now', ?))
+            ''',
+            (seller_id, item_id, quantity, price, currency, f"+{duration_hours} hours"),
+            commit=True)
 
-    # Методы для работы с глобальными событиями (новые)
-    def create_global_event(self, event_type: str, duration: float, event_data: Dict = {}) -> bool:
-        """Создание глобального события"""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            start_time = time.time()
-            end_time = start_time + duration
+    def get_active_listings(self, item_id: Optional[str] = None) -> List[Dict]:
+        """Получить активные предложения на рынке"""
+        query = '''
+            SELECT l.*, p.name as seller_name
+            FROM market_listings l
+            JOIN players p ON l.seller_id = p.player_id
+            WHERE datetime('now') < l.expires_at
+        '''
+        params = ()
+        
+        if item_id:
+            query += ' AND l.item_id = ?'
+            params = (item_id,)
             
-            cursor.execute('''INSERT INTO global_events 
-                            (event_type, start_time, end_time, event_data) 
-                            VALUES (?, ?, ?, ?)''',
-                          (event_type, start_time, end_time, json.dumps(event_data)))
-            conn.commit()
-            return True
-        except (sqlite3.Error, json.JSONDecodeError) as e:
-            logger.error(f"Ошибка создания события {event_type}: {e}")
-            return False
+        query += ' ORDER BY l.price ASC'
+        
+        cursor = self.execute_query(query, params)
+        return [dict(row) for row in cursor.fetchall()]
 
-    def get_active_events(self) -> List[Dict]:
-        """Получение активных глобальных событий"""
+    # Утилитные методы
+    def backup_database(self, backup_path: str):
+        """Создать резервную копию базы данных"""
         try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            current_time = time.time()
-            
-            cursor.execute('''SELECT event_id, event_type, start_time, end_time, event_data 
-                            FROM global_events 
-                            WHERE start_time <= ? AND end_time >= ?''',
-                          (current_time, current_time))
-            
-            events = []
-            for row in cursor.fetchall():
-                events.append({
-                    'event_id': row[0],
-                    'event_type': row[1],
-                    'start_time': row[2],
-                    'end_time': row[3],
-                    'event_data': json.loads(row[4])
-                })
-            
-            return events
-        except (sqlite3.Error, json.JSONDecodeError) as e:
-            logger.error(f"Ошибка получения активных событий: {e}")
-            return []
-# Глобальный экземпляр базы данных для обратной совместимости
+            with self.get_connection() as conn:
+                with open(backup_path, 'w') as f:
+                    for line in conn.iterdump():
+                        f.write(f'{line}\n')
+            logger.info(f"Database backup created at {backup_path}")
+        except Exception as e:
+            logger.error(f"Backup failed: {e}")
+            raise
+
+# Инициализация синглтона базы данных
 db_instance = Database()
-
-def init_db():
-    """Функция для обратной совместимости"""
-    return db_instance._initialize_db()
-
-def save_player(player_id, player_data):
-    return db_instance.save_player(player_id, player_data)
-
-def load_player(player_id):
-    return db_instance.load_player(player_id)
-
-# ... остальные функции для обратной совместимости ...
