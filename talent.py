@@ -1,120 +1,173 @@
-############################
-### talent.py - Система талантов ###
-############################
-"""
-Модуль системы талантов:
-- Деревья талантов для каждого оружия
-- Изучение талантов
-- Пассивные бонусы
-- Сброс талантов
-"""
-import database as db
-import world
-from telebot import types
+import logging
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+from enum import Enum, auto
 
-def show_talents(bot, message):
-    player_id = message.from_user.id
-    player_data = db.load_player(player_id)
-    
-    if not player_data or not player_data["current_weapon"]:
-        bot.send_message(message.chat.id, "❌ Сначала выбери оружие!")
-        return
-    
-    weapon = player_data["current_weapon"]
-    talent_tree = world.talent_trees[weapon]
-    
-    talent_text = f"🌳 *Древо талантов: {world.weapons_data[weapon]['name']}*\n"
-    talent_text += f"Очки талантов: {player_data.get('talent_points', 0)}\n\n"
-    
-    markup = types.InlineKeyboardMarkup()
-    
-    for talent in talent_tree:
-        learned = talent["id"] in player_data.get("learned_talents", [])
-        talent_text += f"{'✅' if learned else '🔲'} {talent['name']} - {talent['cost']} оч."
-        talent_text += f" ({talent['effect']})\n"
-        
-        if not learned and player_data.get('talent_points', 0) >= talent['cost']:
-            markup.add(types.InlineKeyboardButton(
-                f"Изучить {talent['name']}",
-                callback_data=f"learn_{talent['id']}"
-            ))
-    
-    markup.add(types.InlineKeyboardButton("🔁 Сбросить таланты (1000g)", callback_data="reset_talents"))
-    
-    bot.send_message(
-        message.chat.id,
-        talent_text,
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
+logger = logging.getLogger(__name__)
 
-def learn_talent(bot, call):
-    player_id = call.from_user.id
-    player_data = db.load_player(player_id)
-    talent_id = call.data.split("_")[1]
-    
-    if not player_data:
-        bot.answer_callback_query(call.id, "❌ Ошибка загрузки данных!")
-        return
-    
-    # Находим талант в дереве
-    weapon = player_data["current_weapon"]
-    talent = next((t for t in world.talent_trees[weapon] if t["id"] == talent_id), None)
-    
-    if not talent:
-        bot.answer_callback_query(call.id, "❌ Талант не найден!")
-        return
-    
-    # Проверяем, можно ли изучить
-    if player_data.get('talent_points', 0) >= talent['cost']:
-        player_data['talent_points'] -= talent['cost']
-        
-        if "learned_talents" not in player_data:
-            player_data["learned_talents"] = []
-        player_data["learned_talents"].append(talent_id)
-        
-        # Применяем эффект таланта
-        apply_talent_effect(player_data, talent)
-        
-        db.save_player(player_id, player_data)
-        bot.answer_callback_query(call.id, f"✨ Ты изучил талант {talent['name']}!")
-        show_talents(bot, call.message)
-    else:
-        bot.answer_callback_query(call.id, "❌ Недостаточно очков талантов!")
+class TalentType(Enum):
+    """Типы талантов"""
+    ATTRIBUTE = auto()      # Увеличение характеристик
+    COMBAT = auto()         # Боевые умения
+    CRAFTING = auto()       # Крафтовые навыки
+    EXPLORATION = auto()    # Навыки исследования
+    SPECIAL = auto()        # Уникальные способности
 
-def apply_talent_effect(player_data, talent):
-    # Применяем эффект таланта к персонажу
-    effect = talent["effect"]
-    
-    if effect.startswith("damage+"):
-        # Добавляем бонус к урону
-        bonus = float(effect.replace("damage+", "").replace("%", "")) / 100
-        # Сохраняем в активных эффектах
-        player_data["active_effects"].append({
-            "type": "damage_bonus",
-            "value": bonus
-        })
-    # ... другие эффекты
+@dataclass
+class TalentNode:
+    """Узел дерева талантов"""
+    id: str
+    name: str
+    description: str
+    type: TalentType
+    max_rank: int
+    current_rank: int = 0
+    requirements: List[str] = None
+    cost_per_rank: List[int] = None
+    effect_per_rank: List[Dict] = None
 
-def reset_talents(bot, call):
-    player_id = call.from_user.id
-    player_data = db.load_player(player_id)
-    
-    if not player_data:
-        bot.answer_callback_query(call.id, "❌ Ошибка загрузки данных!")
-        return
-    
-    if player_data["gold"] >= 1000:
-        player_data["gold"] -= 1000
-        talent_points = len(player_data.get("learned_talents", []))
-        player_data["talent_points"] += talent_points
-        player_data["learned_talents"] = []
+    def __post_init__(self):
+        self.requirements = self.requirements or []
+        self.cost_per_rank = self.cost_per_rank or [1] * self.max_rank
+        self.effect_per_rank = self.effect_per_rank or [{}] * self.max_rank
+
+    def can_unlock(self, player) -> bool:
+        """Можно ли разблокировать талант"""
+        if self.current_rank >= self.max_rank:
+            return False
+            
+        for req in self.requirements:
+            if not player.talents.get(req, 0) > 0:
+                return False
+                
+        return player.talent_points >= self.cost_per_rank[self.current_rank]
+
+    def apply_effect(self, player):
+        """Применить эффект таланта"""
+        if self.current_rank == 0:
+            return
+            
+        effect = self.effect_per_rank[self.current_rank - 1]
         
-        # Удаляем эффекты талантов
-        player_data["active_effects"] = [e for e in player_data["active_effects"] if e.get("source") != "talent"]
+        if self.type == TalentType.ATTRIBUTE:
+            player.attributes[effect['attribute']] += effect['value']
+        elif self.type == TalentType.COMBAT:
+            player.combat_modifiers[effect['modifier']] = effect['value']
+        # Другие типы эффектов...
+
+class TalentTree:
+    """Дерево талантов персонажа"""
+    def __init__(self):
+        self.talents: Dict[str, TalentNode] = {}
+        self._initialize_talents()
+    
+    def _initialize_talents(self):
+        """Инициализация всех доступных талантов"""
+        self.talents = {
+            # Базовые атрибуты
+            'strength': TalentNode(
+                id='strength',
+                name='Сила',
+                description='Увеличивает вашу атаку в ближнем бою',
+                type=TalentType.ATTRIBUTE,
+                max_rank=5,
+                cost_per_rank=[1, 2, 3, 4, 5],
+                effect_per_rank=[
+                    {'attribute': 'attack', 'value': 1},
+                    {'attribute': 'attack', 'value': 2},
+                    {'attribute': 'attack', 'value': 3},
+                    {'attribute': 'attack', 'value': 4},
+                    {'attribute': 'attack', 'value': 5}
+                ]
+            ),
+            
+            # Боевые таланты
+            'critical_strike': TalentNode(
+                id='critical_strike',
+                name='Критический удар',
+                description='Шанс нанести двойной урон',
+                type=TalentType.COMBAT,
+                max_rank=3,
+                requirements=['strength'],
+                cost_per_rank=[2, 3, 4],
+                effect_per_rank=[
+                    {'modifier': 'crit_chance', 'value': 0.05},
+                    {'modifier': 'crit_chance', 'value': 0.10},
+                    {'modifier': 'crit_chance', 'value': 0.15}
+                ]
+            ),
+            
+            # Пример специального таланта
+            'treasure_hunter': TalentNode(
+                id='treasure_hunter',
+                name='Искатель сокровищ',
+                description='Увеличивает шанс найти сокровища',
+                type=TalentType.EXPLORATION,
+                max_rank=2,
+                cost_per_rank=[3, 5],
+                effect_per_rank=[
+                    {'modifier': 'treasure_chance', 'value': 0.1},
+                    {'modifier': 'treasure_chance', 'value': 0.2}
+                ]
+            )
+        }
+    
+    def get_available_talents(self, player) -> List[TalentNode]:
+        """Получить список доступных для изучения талантов"""
+        return [
+            talent for talent in self.talents.values() 
+            if talent.can_unlock(player)
+        ]
+    
+    def unlock_talent(self, player, talent_id: str) -> bool:
+        """Попытаться изучить талант"""
+        if talent_id not in self.talents:
+            return False
+            
+        talent = self.talents[talent_id]
         
-        db.save_player(player_id, player_data)
-        bot.answer_callback_query(call.id, "🔁 Таланты сброшены!")
-        show_talents(bot, call.message)
-    else:
-        bot.answer_callback_query(call.id, "❌ Недостаточно золота!")
+        if not talent.can_unlock(player):
+            return False
+            
+        cost = talent.cost_per_rank[talent.current_rank]
+        player.talent_points -= cost
+        talent.current_rank += 1
+        talent.apply_effect(player)
+        
+        logger.info(f"Player {player.user_id} unlocked {talent_id} rank {talent.current_rank}")
+        return True
+
+class TalentManager:
+    """Менеджер талантов для игрока"""
+    def __init__(self, player):
+        self.player = player
+        self.tree = TalentTree()
+    
+    def add_talent_point(self, amount: int = 1):
+        """Добавить очки талантов"""
+        self.player.talent_points += amount
+    
+    def get_talent_info(self, talent_id: str) -> Optional[TalentNode]:
+        """Получить информацию о таланте"""
+        return self.tree.talents.get(talent_id)
+    
+    def get_all_talents(self) -> Dict[str, TalentNode]:
+        """Получить все таланты"""
+        return self.tree.talents
+    
+    def unlock_talent(self, talent_id: str) -> bool:
+        """Попытаться изучить талант"""
+        return self.tree.unlock_talent(self.player, talent_id)
+    
+    def reset_talents(self, cost: int = 0) -> bool:
+        """Сбросить все таланты"""
+        if self.player.gold < cost:
+            return False
+            
+        self.player.gold -= cost
+        for talent in self.tree.talents.values():
+            talent.current_rank = 0
+        
+        # Нужно пересчитать все атрибуты персонажа
+        self.player.recalculate_attributes()
+        return True
