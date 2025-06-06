@@ -1,173 +1,308 @@
-############################
-### shop.py - Магазин и крафт ###
-############################
-"""
-Модуль магазина и крафта:
-- Покупка предметов
-- Продажа артефактов
-- Крафт предметов
-- Улучшение оружия
-- Система кузнеца
-"""
-import database as db
-import world
-import player
-from telebot import types
+import logging
+import json
+from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+from enum import Enum, auto
+from datetime import datetime, timedelta
+from database import Database
+from player import Player
 
-def shop_menu(bot, message):
-    player_id = message.from_user.id
-    player_data = db.load_player(player_id)
-    if player_data is None:
-        bot.send_message(message.chat.id, "❌ Ошибка загрузки данных! Попробуй перезапустить бота командой /start")
-        return
+logger = logging.getLogger(__name__)
 
-    shop_text = f"🛒 *Магазин Башни*\nЗолото: {player_data['gold']}\n\n*Товары:*\n"
+class ItemType(Enum):
+    WEAPON = auto()
+    ARMOR = auto()
+    CONSUMABLE = auto()
+    MATERIAL = auto()
+    QUEST = auto()
+    SPECIAL = auto()
 
-    markup = types.InlineKeyboardMarkup()
-    for item, data in world.shop_items.items():
-        item_text = "{} - {}g\n{}".format(
-            item.replace("_", " ").title(),
-            data["price"],
-            data["description"]
-        )
-        shop_text += item_text + "\n\n"
+class CurrencyType(Enum):
+    GOLD = auto()
+    HONOR = auto()
+    TOKENS = auto()
+    GUILD_COINS = auto()
 
-        markup.add(types.InlineKeyboardButton(
-            f"Купить {item.replace('_', ' ')} ({data['price']}g)",
-            callback_data=f"buy_{item}"
-        ))
+@dataclass
+class ShopItem:
+    id: str
+    name: str
+    type: ItemType
+    price: int
+    currency: CurrencyType
+    stock: int
+    max_per_player: int
+    required_level: int
+    required_rank: Optional[str] = None
+    required_quest: Optional[str] = None
+    discount: float = 1.0
+    expires_at: Optional[datetime] = None
 
-    markup.add(types.InlineKeyboardButton("Продать артефакт (100g)", callback_data="sell_artifact"))
-    markup.add(types.InlineKeyboardButton("🏭 Посетить кузнеца", callback_data="blacksmith"))
+@dataclass
+class PlayerPurchase:
+    player_id: int
+    item_id: str
+    quantity: int
+    last_purchased: datetime
 
-    bot.send_message(message.chat.id, shop_text, reply_markup=markup, parse_mode="Markdown")
+class ShopManager:
+    def __init__(self, db: Database, config_path: str = "shop_config.json"):
+        self.db = db
+        self.items: Dict[str, ShopItem] = {}
+        self.player_purchases: Dict[int, Dict[str, PlayerPurchase]] = {}
+        self.load_config(config_path)
+        self.load_purchase_history()
 
-def buy_item(bot, call):
-    player_id = call.from_user.id
-    player_data = db.load_player(player_id)
-    if player_data is None:
-        bot.answer_callback_query(call.id, "❌ Ошибка загрузки данных!")
-        return
+    def load_config(self, config_path: str):
+        """Загрузить конфигурацию магазина из файла"""
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+                for item_data in data['items']:
+                    item = ShopItem(
+                        id=item_data['id'],
+                        name=item_data['name'],
+                        type=ItemType[item_data['type']],
+                        price=item_data['price'],
+                        currency=CurrencyType[item_data['currency']],
+                        stock=item_data.get('stock', -1),
+                        max_per_player=item_data.get('max_per_player', -1),
+                        required_level=item_data.get('required_level', 1),
+                        required_rank=item_data.get('required_rank'),
+                        required_quest=item_data.get('required_quest'),
+                        discount=item_data.get('discount', 1.0),
+                        expires_at=datetime.fromisoformat(item_data['expires_at']) if 'expires_at' in item_data else None
+                    )
+                    self.items[item.id] = item
+                    
+        except Exception as e:
+            logger.error(f"Failed to load shop config: {e}")
+            raise
 
-    item = call.data.split("_")[1]
-    item_data = world.shop_items.get(item)
+    def load_purchase_history(self):
+        """Загрузить историю покупок игроков из БД"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT player_id, item_id, quantity, last_purchased FROM shop_purchases")
+            
+            for row in cursor.fetchall():
+                player_id, item_id, quantity, last_purchased = row
+                
+                if player_id not in self.player_purchases:
+                    self.player_purchases[player_id] = {}
+                    
+                self.player_purchases[player_id][item_id] = PlayerPurchase(
+                    player_id=player_id,
+                    item_id=item_id,
+                    quantity=quantity,
+                    last_purchased=datetime.fromisoformat(last_purchased)
+                )
 
-    if not item_data:
-        bot.answer_callback_query(call.id, "❌ Этот предмет больше не продается!")
-        return
-
-    if player_data["gold"] >= item_data["price"]:
-        player_data["gold"] -= item_data["price"]
-
-        # Применяем эффект предмета
-        effect_text = ""
-        if item == "health_potion":
-            player_data["inventory"].append("health_potion")
-            effect_text = "💉 Зелье здоровья добавлено в инвентарь!"
-        elif item == "weapon_upgrade":
-            weapon = player_data["current_weapon"]
-            player_data["weapons"][weapon]["level"] += 1
-            effect_text = f"⚡ {world.weapons_data[weapon]['name']} улучшен до уровня {player_data['weapons'][weapon]['level']}!"
-            player.check_new_skills(bot, player_id, weapon)
-        elif item == "armor_upgrade":
-            player_data["stats"]["defense"] += 5
-            effect_text = f"🛡️ Защита увеличена до {player_data['stats']['defense']}!"
-        elif item == "elixir_strength":
-            player_data["inventory"].append("elixir_strength")
-            effect_text = "💪 Эликсир силы добавлен в инвентарь!"
-        elif item == "elixir_agility":
-            player_data["inventory"].append("elixir_agility")
-            effect_text = "🏃 Эликсир ловкости добавлен в инвентарь!"
-        elif item == "elixir_vitality":
-            player_data["inventory"].append("elixir_vitality")
-            effect_text = "❤️ Эликсир живучести добавлен в инвентарь!"
-        elif item == "elixir_luck":
-            player_data["inventory"].append("elixir_luck")
-            effect_text = "🍀 Эликсир удачи добавлен в инвентарь!"
-        elif item == "boss_key":
-            player_data["inventory"].append("boss_key")
-            effect_text = "🔑 Ключ босса добавлен в инвентарь!"
-        else:
-            effect_text = "✅ Предмет куплен!"
-
-        db.save_player(player_id, player_data)
-        bot.answer_callback_query(call.id, effect_text)
-        shop_menu(bot, call.message)
-    else:
-        bot.answer_callback_query(call.id, "❌ Недостаточно золота!")
-
-def craft_item(bot, call):
-    player_id = call.from_user.id
-    player_data = db.load_player(player_id)
-    item_id = call.data.split("_")[1]
-
-    # Логика создания предмета
-    # В реальной реализации здесь должна быть проверка материалов и создание предмета
-    bot.answer_callback_query(call.id, f"🔧 Предмет {item_id} создан!")
-    blacksmith_menu(bot, call.message)
-
-def upgrade_weapon(bot, call):
-    player_id = call.from_user.id
-    player_data = db.load_player(player_id)
-    weapon_type = call.data.split("_")[1]
-
-    if weapon_type not in player_data["weapons"]:
-        bot.answer_callback_query(call.id, "❌ У тебя нет такого оружия!")
-        return
-
-    current_level = player_data["weapons"][weapon_type]["level"]
-    upgrade_cost = current_level * 500
-
-    if player_data["gold"] >= upgrade_cost:
-        player_data["gold"] -= upgrade_cost
-        player_data["weapons"][weapon_type]["level"] += 1
-
-        # Начисляем талант-пойнты каждые 5 уровней
-        if player_data["weapons"][weapon_type]["level"] % 5 == 0:
-            player_data["talent_points"] = player_data.get("talent_points", 0) + 1
-
-        db.save_player(player_id, player_data)
-        bot.answer_callback_query(call.id, f"⚡ Оружие улучшено до уровня {player_data['weapons'][weapon_type]['level']}!")
-    else:
-        bot.answer_callback_query(call.id, "❌ Недостаточно золота!")
-
-    blacksmith_menu(bot, call.message)
-
-def blacksmith_menu(bot, message):
-    player_id = message.from_user.id
-    player_data = db.load_player(player_id)
-
-    if player_data is None:
-        return
-
-    markup = types.InlineKeyboardMarkup()
-
-    # Проверяем, есть ли у игрока чертежи
-    blueprints = [item for item in player_data["inventory"] if "blueprint" in item]
-
-    if blueprints:
-        for bp in blueprints:
-            markup.add(types.InlineKeyboardButton(
-                f"Создать {bp.replace('_', ' ')}",
-                callback_data=f"craft_{bp}"
+    def save_purchase(self, player_id: int, item_id: str, quantity: int):
+        """Сохранить информацию о покупке в БД"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Обновить или добавить запись
+            cursor.execute("""
+                INSERT OR REPLACE INTO shop_purchases 
+                (player_id, item_id, quantity, last_purchased) 
+                VALUES (?, ?, ?, ?)
+            """, (
+                player_id,
+                item_id,
+                quantity,
+                datetime.now().isoformat()
             ))
+            
+            conn.commit()
+            
+            # Обновить кеш
+            if player_id not in self.player_purchases:
+                self.player_purchases[player_id] = {}
+                
+            self.player_purchases[player_id][item_id] = PlayerPurchase(
+                player_id=player_id,
+                item_id=item_id,
+                quantity=quantity,
+                last_purchased=datetime.now()
+            )
 
-    # Кнопки улучшения оружия
-    weapon = player_data["current_weapon"]
-    if weapon:
-        weapon_level = player_data["weapons"][weapon]["level"]
-        upgrade_cost = weapon_level * 500
+    def get_available_items(self, player: Player) -> List[ShopItem]:
+        """Получить список доступных для игрока товаров"""
+        available_items = []
+        
+        for item in self.items.values():
+            # Проверить срок действия
+            if item.expires_at and item.expires_at < datetime.now():
+                continue
+                
+            # Проверить уровень
+            if player.level < item.required_level:
+                continue
+                
+            # Проверить ранги/квесты
+            if item.required_rank and item.required_rank not in player.ranks:
+                continue
+                
+            if item.required_quest and item.required_quest not in player.completed_quests:
+                continue
+                
+            # Проверить остаток
+            if item.stock == 0:
+                continue
+                
+            available_items.append(item)
+            
+        return available_items
 
-        markup.add(types.InlineKeyboardButton(
-            f"Улучшить {world.weapons_data[weapon]['name']} (Ур. {weapon_level} → {weapon_level+1}) - {upgrade_cost}g",
-            callback_data=f"upgrade_{weapon}"
-        ))
+    def get_player_purchases(self, player_id: int, item_id: str = None) -> Union[PlayerPurchase, Dict[str, PlayerPurchase]]:
+        """Получить историю покупок игрока"""
+        if player_id not in self.player_purchases:
+            return {} if item_id is None else None
+            
+        if item_id:
+            return self.player_purchases[player_id].get(item_id)
+            
+        return self.player_purchases[player_id]
 
-    markup.add(types.InlineKeyboardButton("Расплавить предметы", callback_data="melt_items"))
+    def purchase_item(self, player: Player, item_id: str, quantity: int = 1) -> Dict:
+        """Покупка товара игроком"""
+        if item_id not in self.items:
+            return {'success': False, 'message': 'Товар не найден'}
+            
+        item = self.items[item_id]
+        
+        # Проверить доступность
+        if not self._check_availability(player, item, quantity):
+            return {'success': False, 'message': 'Товар недоступен для покупки'}
+            
+        # Проверить валюту
+        currency_balance = self._get_player_currency(player, item.currency)
+        total_price = int(item.price * quantity * item.discount)
+        
+        if currency_balance < total_price:
+            return {'success': False, 'message': 'Недостаточно средств'}
+            
+        # Проверить инвентарь
+        if not player.has_inventory_space(quantity):
+            return {'success': False, 'message': 'Недостаточно места в инвентаре'}
+            
+        # Выполнить покупку
+        self._deduct_currency(player, item.currency, total_price)
+        player.add_item_to_inventory(item_id, quantity)
+        
+        # Обновить остатки
+        if item.stock > 0:
+            item.stock -= quantity
+            
+        # Обновить историю покупок
+        current_purchases = self.get_player_purchases(player.user_id, item_id)
+        new_quantity = quantity + (current_purchases.quantity if current_purchases else 0)
+        self.save_purchase(player.user_id, item_id, new_quantity)
+        
+        return {
+            'success': True,
+            'message': f'Успешно куплено {quantity} {item.name}',
+            'remaining_balance': self._get_player_currency(player, item.currency),
+            'remaining_stock': item.stock
+        }
 
-    bot.send_message(
-        message.chat.id,
-        "🔥 *Кузница Башни*\nЗдесь можно создавать и улучшать оружие",
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
+    def _check_availability(self, player: Player, item: ShopItem, quantity: int) -> bool:
+        """Проверить доступность товара"""
+        # Проверить срок действия
+        if item.expires_at and item.expires_at < datetime.now():
+            return False
+            
+        # Проверить уровень
+        if player.level < item.required_level:
+            return False
+            
+        # Проверить ранги/квесты
+        if item.required_rank and item.required_rank not in player.ranks:
+            return False
+            
+        if item.required_quest and item.required_quest not in player.completed_quests:
+            return False
+            
+        # Проверить остаток
+        if item.stock > 0 and quantity > item.stock:
+            return False
+            
+        # Проверить лимит на игрока
+        if item.max_per_player > 0:
+            player_purchase = self.get_player_purchases(player.user_id, item.id)
+            if player_purchase and player_purchase.quantity + quantity > item.max_per_player:
+                return False
+                
+        return True
+
+    def _get_player_currency(self, player: Player, currency: CurrencyType) -> int:
+        """Получить баланс игрока в указанной валюте"""
+        if currency == CurrencyType.GOLD:
+            return player.gold
+        elif currency == CurrencyType.HONOR:
+            return player.honor
+        elif currency == CurrencyType.TOKENS:
+            return player.tokens
+        elif currency == CurrencyType.GUILD_COINS:
+            return player.guild_coins
+        return 0
+
+    def _deduct_currency(self, player: Player, currency: CurrencyType, amount: int):
+        """Списать валюту с игрока"""
+        if currency == CurrencyType.GOLD:
+            player.gold -= amount
+        elif currency == CurrencyType.HONOR:
+            player.honor -= amount
+        elif currency == CurrencyType.TOKENS:
+            player.tokens -= amount
+        elif currency == CurrencyType.GUILD_COINS:
+            player.guild_coins -= amount
+
+    def add_discount(self, item_id: str, discount: float, duration_hours: int = 24):
+        """Добавить временную скидку на товар"""
+        if item_id in self.items:
+            self.items[item_id].discount = discount
+            self.items[item_id].expires_at = datetime.now() + timedelta(hours=duration_hours)
+
+    def restock_items(self):
+        """Пополнить запасы товаров (вызывается по расписанию)"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT item_id, stock FROM shop_restock")
+            
+            for item_id, stock in cursor.fetchall():
+                if item_id in self.items:
+                    self.items[item_id].stock = stock
+
+    def get_limited_offers(self) -> List[ShopItem]:
+        """Получить список товаров с ограниченным предложением"""
+        return [
+            item for item in self.items.values()
+            if item.stock > 0 or item.max_per_player > 0 or item.expires_at
+        ]
+
+    def get_daily_deals(self, player: Player) -> List[ShopItem]:
+        """Получить ежедневные предложения для игрока"""
+        today = datetime.now().date()
+        seed = hash(f"{player.user_id}_{today}") % 1000
+        
+        # Выбрать 3 случайных товара с учетом уровня игрока
+        eligible_items = [
+            item for item in self.items.values()
+            if player.level >= item.required_level and
+               item.discount >= 1.0 and
+               (not item.required_rank or item.required_rank in player.ranks)
+        ]
+        
+        random.seed(seed)
+        daily_items = random.sample(eligible_items, min(3, len(eligible_items)))
+        
+        # Применить скидку 20% на ежедневные товары
+        for item in daily_items:
+            item.discount = 0.8
+            item.expires_at = datetime.now() + timedelta(hours=24)
+            
+        return daily_items
